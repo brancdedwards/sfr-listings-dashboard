@@ -4,10 +4,12 @@ Scrapes single-family rental listings from 6 providers into one database.
 Sources: Tricon, Progress Residential, Invitation Homes, AMH, Main Street Renewal, FirstKey Homes
 """
 
+import argparse
 import json
 import math
 import os
 import re
+import sys
 import traceback
 from datetime import datetime
 
@@ -26,6 +28,7 @@ if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
 JSON_DIR = 'json'
+HEADLESS = False  # Set True via --headless flag; skips JSON saves and interactive prompts
 
 BROWSER_UA = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -109,7 +112,9 @@ UNIQUE_KEYS = {
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def save_json(data, filename):
-    """Save cleaned JSON to the json/ directory."""
+    """Save cleaned JSON to the json/ directory. Skipped in headless mode."""
+    if HEADLESS:
+        return
     os.makedirs(JSON_DIR, exist_ok=True)
     path = os.path.join(JSON_DIR, filename)
     with open(path, 'w') as f:
@@ -124,8 +129,77 @@ def get_engine():
     return create_engine(DATABASE_URL)
 
 
-def upsert_to_db(df, table_name, unique_key):
-    """UPSERT DataFrame into a Postgres table with soft-delete tracking."""
+def ensure_scrape_log_table(engine):
+    """Create scrape_log table if it doesn't exist."""
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scrape_log (
+                id SERIAL PRIMARY KEY,
+                source TEXT NOT NULL,
+                started_at TIMESTAMP NOT NULL,
+                finished_at TIMESTAMP,
+                status TEXT NOT NULL,
+                listings_found INTEGER DEFAULT 0,
+                listings_new INTEGER DEFAULT 0,
+                listings_deactivated INTEGER DEFAULT 0,
+                error_message TEXT,
+                metro_location TEXT
+            )
+        """))
+        conn.commit()
+
+
+def log_scrape_start(source_key, metro_location):
+    """Log that a scraper has started. Returns the log row id."""
+    engine = get_engine()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ensure_scrape_log_table(engine)
+    with engine.connect() as conn:
+        result = conn.execute(text(
+            "INSERT INTO scrape_log (source, started_at, status, metro_location) "
+            "VALUES (:source, :started_at, 'running', :metro) RETURNING id"
+        ), {'source': source_key, 'started_at': now, 'metro': metro_location})
+        log_id = result.fetchone()[0]
+        conn.commit()
+    engine.dispose()
+    return log_id
+
+
+def log_scrape_end(log_id, status, listings_found=0, listings_new=0,
+                   listings_deactivated=0, error_message=None):
+    """Update a scrape log entry with results."""
+    engine = get_engine()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with engine.connect() as conn:
+        conn.execute(text(
+            "UPDATE scrape_log SET finished_at = :finished_at, status = :status, "
+            "listings_found = :found, listings_new = :new, "
+            "listings_deactivated = :deactivated, error_message = :error "
+            "WHERE id = :id"
+        ), {
+            'finished_at': now, 'status': status,
+            'found': listings_found, 'new': listings_new,
+            'deactivated': listings_deactivated,
+            'error': error_message, 'id': log_id,
+        })
+        conn.commit()
+    engine.dispose()
+
+
+# ── Price column mapping per source table ────────────────────────────────────
+
+PRICE_COLS = {
+    'tricon_listings': 'price',
+    'progress_listings': 'current_price',
+    'invh_listings': 'rent',
+    'amh_listings': 'rent',
+    'msr_listings': 'rent',
+    'firstkey_listings': 'rent',
+}
+
+
+def upsert_to_db(df, table_name, unique_key, price_col=None):
+    """UPSERT DataFrame into a Postgres table with soft-delete and price tracking."""
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     engine = get_engine()
 
@@ -872,13 +946,58 @@ def build_master_listings():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global HEADLESS
+
+    parser = argparse.ArgumentParser(description='SFR Listings Scraper')
+    parser.add_argument('--headless', action='store_true',
+                        help='Run without interactive prompts (uses env vars)')
+    args = parser.parse_args()
+    HEADLESS = args.headless
+
     print('=' * 60)
     print('  SFR Listings Scraper')
     print('=' * 60)
 
-    # Metro location input
-    metro_city = input('\nEnter metro city (e.g. houston, dallas, atlanta): ').strip().lower()
-    metro_state = input('Enter state code (e.g. TX, GA, AZ, FL): ').strip().upper()
+    if HEADLESS:
+        # ── Headless mode: read config from environment variables ──
+        metro_city = os.environ.get('SCRAPE_CITY', '').strip().lower()
+        metro_state = os.environ.get('SCRAPE_STATE', '').strip().upper()
+        source_choice = os.environ.get('SCRAPE_SOURCES', 'all').strip().lower()
+
+        if not metro_city or not metro_state:
+            print('ERROR: SCRAPE_CITY and SCRAPE_STATE env vars required in headless mode')
+            sys.exit(1)
+
+        print(f'  Mode: headless')
+        print(f'  City: {metro_city}, State: {metro_state}')
+
+        if source_choice == 'all':
+            selected = list(SCRAPERS.keys())
+        else:
+            selected = [c.strip() for c in source_choice.split(',') if c.strip() in SCRAPERS]
+    else:
+        # ── Interactive mode: prompt user ──
+        metro_city = input('\nEnter metro city (e.g. houston, dallas, atlanta): ').strip().lower()
+        metro_state = input('Enter state code (e.g. TX, GA, AZ, FL): ').strip().upper()
+
+        # Scraper selection
+        print('\nWhich scraper(s) do you want to run?')
+        print('-' * 40)
+        for k, (name, _) in SCRAPERS.items():
+            print(f'  {k}. {name}')
+        print(f'  7. Run ALL scrapers')
+        print()
+
+        choice = input('Enter choice (e.g. 1, 3,5 or 7 for all): ').strip()
+
+        if choice == '7':
+            selected = list(SCRAPERS.keys())
+        else:
+            selected = [c.strip() for c in choice.split(',') if c.strip() in SCRAPERS]
+
+    if not selected:
+        print('No valid scrapers selected. Exiting.')
+        return
 
     state_full = STATE_FULL_NAMES.get(metro_state)
     if not state_full:
@@ -897,40 +1016,21 @@ def main():
         'firstkey': metro_city,
     }
 
-    # Validate Invitation Homes market
+    # Validate markets
     if metro['invh'] not in INVH_MARKETS:
         print(f'Warning: "{metro["invh"]}" not in Invitation Homes markets list')
-
-    # Validate FirstKey market
     if metro['firstkey'] not in FKH_MARKETS:
         print(f'Warning: "{metro["firstkey"]}" not in FirstKey Homes markets list')
 
-    # Scraper selection
-    print('\nWhich scraper(s) do you want to run?')
-    print('-' * 40)
-    for k, (name, _) in SCRAPERS.items():
-        print(f'  {k}. {name}')
-    print(f'  7. Run ALL scrapers')
-    print()
-
-    choice = input('Enter choice (e.g. 1, 3,5 or 7 for all): ').strip()
-
-    if choice == '7':
-        selected = list(SCRAPERS.keys())
-    else:
-        selected = [c.strip() for c in choice.split(',') if c.strip() in SCRAPERS]
-
-    if not selected:
-        print('No valid scrapers selected. Exiting.')
-        return
-
     selected_names = [SCRAPERS[s][0] for s in selected]
     selected_keys = [SCRAPERS[s][1] for s in selected]
+    metro_location = f'{metro_city}-{metro_state.lower()}'
     print(f'\nRunning: {", ".join(selected_names)}')
     print('=' * 60)
 
     # Run scrapers
     for key in selected_keys:
+        log_id = log_scrape_start(key, metro_location)
         try:
             if key == 'tricon':
                 df = scrape_tricon(metro['tricon'])
@@ -940,6 +1040,7 @@ def main():
                 lat, lng = INVH_MARKETS.get(metro['invh'], (0, 0))
                 if lat == 0:
                     print(f'  Skipping Invitation Homes: market "{metro["invh"]}" not found')
+                    log_scrape_end(log_id, 'error', error_message='Market not found')
                     continue
                 df = scrape_invh(metro['invh'], lat, lng)
             elif key == 'amh':
@@ -949,14 +1050,21 @@ def main():
             elif key == 'firstkey':
                 df = scrape_firstkey(metro['firstkey'])
             else:
+                log_scrape_end(log_id, 'error', error_message='Unknown scraper key')
                 continue
 
-            upsert_to_db(df, TABLE_NAMES[key], UNIQUE_KEYS[key])
+            counts = upsert_to_db(df, TABLE_NAMES[key], UNIQUE_KEYS[key],
+                                  price_col=PRICE_COLS.get(TABLE_NAMES[key]))
+            log_scrape_end(log_id, 'success',
+                           listings_found=counts['total'],
+                           listings_new=counts['new'],
+                           listings_deactivated=counts['deactivated'])
             print()
 
         except Exception as e:
             print(f'  ERROR: {key} failed -- {e}')
             traceback.print_exc()
+            log_scrape_end(log_id, 'error', error_message=str(e)[:500])
             print()
 
     # Build master table
@@ -965,7 +1073,8 @@ def main():
     print('\n' + '=' * 60)
     print('  Done!')
     print(f'  Database: Render Postgres')
-    print(f'  JSON files: {JSON_DIR}/')
+    if not HEADLESS:
+        print(f'  JSON files: {JSON_DIR}/')
     print('=' * 60)
 
 
